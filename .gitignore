@@ -1,0 +1,10 @@
+# sorties generees a la racine de code/ lors de l'execution
+code/*.eps
+code/*.vtu
+code/resultats.txt
+code/maillage_etaK.txt
+code/figure_estimateur.png
+
+# Python
+__pycache__/
+*.pyc

@@ -1,0 +1,174 @@
+// ==========================================================================
+//  A QUOI SERT L'ESTIMATEUR : ADAPTATION DE MAILLAGE SUR UN DOMAINE EN L
+//
+//  Sur le carre unite avec une solution reguliere, tous les eta_K se valent :
+//  l'estimateur ne sert qu'a certifier l'erreur. Son vrai interet apparait
+//  quand la solution est singuliere.
+//
+//  Domaine en L : Omega = ]-1,1[^2 \ ( [0,1] x [-1,0] ), coin rentrant
+//  d'angle omega = 3pi/2 a l'origine.
+//
+//  Solution exacte (harmonique, donc f = 0) :
+//      u = r^(2/3) sin(2 theta / 3),   theta dans [0, 3pi/2]
+//  u appartient a H^(1+2/3-eps) seulement : le raffinement UNIFORME converge
+//  en O(h^(2/3)) = O(ndof^(-1/3)) au lieu de O(h) = O(ndof^(-1/2)).
+//  Le raffinement ADAPTATIF pilote par eta_K restaure l'ordre optimal.
+//
+//  Lancement :  FreeFem++ -nw adaptation_Lshape.edp
+// ==========================================================================
+
+verbosity = 0;
+bool graphique = true;
+
+// --------------------------------------------------------------------------
+//  1. GEOMETRIE ET SOLUTION EXACTE
+// --------------------------------------------------------------------------
+// bord parcouru dans le sens direct, en partant de l'origine sur l'axe Ox
+border b1(t=0, 1)  { x = t;      y = 0;      label = 1; }   // theta = 0
+border b2(t=0, 1)  { x = 1;      y = t;      label = 1; }
+border b3(t=1, -1) { x = t;      y = 1;      label = 1; }
+border b4(t=1, -1) { x = -1;     y = t;      label = 1; }
+border b5(t=-1, 0) { x = t;      y = -1;     label = 1; }
+border b6(t=-1, 0) { x = 0;      y = t;      label = 1; }   // theta = 3pi/2
+
+// angle polaire ramene dans [0, 2pi[ : indispensable, atan2 renvoie ]-pi,pi]
+func real thet(real X, real Y)
+{
+    real t = atan2(Y, X);
+    if (t < -1e-14) t += 2*pi;
+    return t;
+}
+func real rad(real X, real Y) { return sqrt(X*X + Y*Y) + 1e-30; }
+
+// u = r^(2/3) sin(2 theta/3) et son gradient en cartesien :
+//   du/dx = -(2/3) r^(-1/3) sin(theta/3)
+//   du/dy =  (2/3) r^(-1/3) cos(theta/3)
+func uex   = pow(rad(x,y), 2./3.) * sin(2.*thet(x,y)/3.);
+func dxuex = -(2./3.) * pow(rad(x,y), -1./3.) * sin(thet(x,y)/3.);
+func dyuex =  (2./3.) * pow(rad(x,y), -1./3.) * cos(thet(x,y)/3.);
+func f     = 0.;                       // u est harmonique
+
+// --------------------------------------------------------------------------
+//  2. UNE ITERATION : resoudre + estimer + mesurer l'erreur vraie
+//  (on utilise des variables globales pour recuperer les resultats)
+// --------------------------------------------------------------------------
+real errGlob, etaGlob;
+
+// --------------------------------------------------------------------------
+//  3. RAFFINEMENT UNIFORME (reference : convergence degradee)
+// --------------------------------------------------------------------------
+cout << endl << "  === RAFFINEMENT UNIFORME ===" << endl;
+cout << "    ndof      |u-u_h|_1        eta         I_eff     taux" << endl;
+
+real olderr = 0, oldndof = 0;
+int Nx = 4;
+for (int k = 0; k < 5; k++)
+{
+    mesh Th = buildmesh(b1(Nx) + b2(Nx) + b3(2*Nx) + b4(2*Nx) + b5(Nx) + b6(Nx));
+    fespace Vh(Th, P1);  fespace Ph(Th, P0);
+    Vh u, v;
+
+    solve Poisson(u, v) = int2d(Th)( dx(u)*dx(v) + dy(u)*dy(v) )
+                        - int2d(Th, qforder=5)( f*v )
+                        + on(1, u = uex);          // Dirichlet NON homogene
+
+    real err = sqrt( int2d(Th, qforder=10)( square(dx(u)-dxuex)
+                                          + square(dy(u)-dyuex) ) );
+
+    varf resVol(unused, chiK)
+        = int2d(Th, qforder=6)( chiK * square(hTriangle) * square(f) );
+    varf saut(unused, chiK)
+        = intalledges(Th)( chiK * 0.5 * (nTonEdge-1) * lenEdge
+                           * square( jump( N.x*dx(u) + N.y*dy(u) ) ) );
+    Ph e1, e2;  e1[] = resVol(0, Ph);  e2[] = saut(0, Ph);
+    Ph etaKsq = e1 + e2;
+    real eta = sqrt( etaKsq[].sum );
+
+    real ndof = Vh.ndof;
+    cout << "    " << ndof << "     " << err << "     " << eta
+         << "     " << eta/err;
+    if (k > 0) cout << "     " << log(olderr/err)/log(ndof/oldndof);
+    cout << endl;
+    olderr = err;  oldndof = ndof;
+    Nx = 2*Nx;
+}
+cout << "    -> taux observe ~ 1/3 : |u-u_h|_1 ~ ndof^(-1/3),"
+     << " la singularite de coin bride tout" << endl;
+
+// --------------------------------------------------------------------------
+//  4. RAFFINEMENT ADAPTATIF PILOTE PAR eta_K
+//
+//  Strategie d'equidistribution : on veut eta_K identique sur tous les K.
+//  Pour P1 et une solution reguliere on a localement eta_K ~ C h_K^2, donc
+//  la taille cible vaut       h_K^{new} = h_K * ( eta_cible / eta_K )^(1/2),
+//  avec eta_cible = theta * eta / sqrt(nt) (moyenne quadratique visee).
+//  On borne le facteur pour eviter les maillages degeneres.
+// --------------------------------------------------------------------------
+cout << endl << "  === RAFFINEMENT ADAPTATIF (pilote par eta_K) ===" << endl;
+cout << "    ndof      |u-u_h|_1        eta         I_eff     taux" << endl;
+
+mesh Th = buildmesh(b1(4) + b2(4) + b3(8) + b4(8) + b5(4) + b6(4));
+olderr = 0; oldndof = 0;
+
+int niter = 12;
+for (int k = 0; k < niter; k++)
+{
+    fespace Vh(Th, P1);  fespace Ph(Th, P0);
+    Vh u, v;
+
+    solve Poisson(u, v) = int2d(Th)( dx(u)*dx(v) + dy(u)*dy(v) )
+                        - int2d(Th, qforder=5)( f*v )
+                        + on(1, u = uex);
+
+    real err = sqrt( int2d(Th, qforder=10)( square(dx(u)-dxuex)
+                                          + square(dy(u)-dyuex) ) );
+
+    varf resVol(unused, chiK)
+        = int2d(Th, qforder=6)( chiK * square(hTriangle) * square(f) );
+    varf saut(unused, chiK)
+        = intalledges(Th)( chiK * 0.5 * (nTonEdge-1) * lenEdge
+                           * square( jump( N.x*dx(u) + N.y*dy(u) ) ) );
+    Ph e1, e2;  e1[] = resVol(0, Ph);  e2[] = saut(0, Ph);
+    Ph etaKsq = e1 + e2;
+    Ph etaK   = sqrt(etaKsq);
+    real eta  = sqrt( etaKsq[].sum );
+
+    real ndof = Vh.ndof;
+    cout << "    " << ndof << "     " << err << "     " << eta
+         << "     " << eta/err;
+    if (k > 0 && ndof > oldndof + 0.5)
+        cout << "     " << log(olderr/err)/log(ndof/oldndof);
+    cout << endl;
+    olderr = err;  oldndof = ndof;
+
+    if (k == niter-1) {
+        if (graphique) {
+            plot(Th, cmm="maillage adapte final", wait=1);
+            plot(u, fill=1, value=1, cmm="u_h sur maillage adapte", wait=1);
+        }
+        break;
+    }
+
+    // ---- nouvelle carte de tailles ---------------------------------------
+    int nt = Th.nt;
+    real etacible = 0.5 * eta / sqrt(nt);   // on vise 2x mieux que la moyenne
+    Ph hK = hTriangle;
+    // min(1.0, .) : on ne DERAFFINE jamais -> le maillage ne fait que croitre
+    Ph hnew = hK * min(1.0, max(0.4, sqrt(etacible / (etaK + 1e-30))));
+
+    fespace V1(Th, P1);
+    V1 metrique = hnew;            // metrique isotrope vue aux sommets
+    Th = adaptmesh(Th, metrique, IsMetric=1, nbvx=200000, splitpbedge=1);
+}
+cout << "    -> taux restaure ~ 1/2 : ndof^(-1/2), ordre optimal de P1"
+     << " malgre la singularite" << endl << endl;
+
+// --------------------------------------------------------------------------
+//  LECTURE
+//  * uniforme  : erreur ~ ndof^(-1/3)  (regularite H^(5/3) limitante)
+//  * adaptatif : erreur ~ ndof^(-1/2)  (ordre optimal de P1)
+//  (le taux affiche est defini par |u-u_h|_1 ~ ndof^(-taux), donc positif)
+//  A nombre de degres de liberte egal, l'adaptatif est bien plus precis :
+//  c'est tout l'interet de l'estimation a posteriori, qui localise l'erreur
+//  SANS connaitre la solution exacte (u n'est utilisee ici que pour valider).
+// --------------------------------------------------------------------------
