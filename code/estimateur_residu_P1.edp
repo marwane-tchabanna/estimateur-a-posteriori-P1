@@ -1,113 +1,72 @@
-// ==========================================================================
-//  ESTIMATION D'ERREUR A POSTERIORI PAR RESIDUS  --  ELEMENTS FINIS P1
-//  Probleme de Poisson avec condition de Dirichlet homogene
+// ======================================================================
+//  ESTIMATEUR D'ERREUR A POSTERIORI PAR RESIDUS -- ELEMENTS FINIS P1
+//  -Delta u = f dans ]0,1[^2,  u = 0 sur dOmega
+//  u = x(x-1)y(y-1)   =>   f = 2[ x(1-x) + y(1-y) ]
 //
-//      -Delta u = f    dans Omega = ]0,1[^2   (carre unite)
-//             u = 0    sur dOmega
+//      eta_1K = h_K || f + Delta u_h ||_{0,K}        (residu volumique)
+//      eta_2K = ( 1/2 sum_E h_E ||[[du_h/dn]]||^2_{0,E} )^{1/2}
+//      eta_3K = 0                (Dirichlet homogene : bord nul)
+//      eta_K^2 = eta_1K^2 + eta_2K^2 ,  eta^2 = sum_K eta_K^2
 //
-//  Solution manufacturee (exercice) :
-//      u(x,y) = x(x-1) y(y-1)          -> nulle sur les 4 cotes : OK
-//      Delta u = 2y(y-1) + 2x(x-1)
-//      f(x,y)  = -Delta u = 2[ x(1-x) + y(1-y) ]
+//      f_K    = (1/|K|) int_K f                      (moyenne de f sur K)
+//      osc_K  = h_K || f - f_K ||_{0,K}               (oscillation des donnees)
 //
-//  Estimateur du cours, pour chaque triangle K de T_h :
-//      eta_1K = h_K || f + Delta u_h ||_{0,K}                (residu volumique)
-//      eta_2K = ( 1/2 sum_{E in E_K^i} h_E ||[[du_h/dn]]||^2_{0,E} )^{1/2}
-//      eta_3K = 0            (Dirichlet homogene : termes de bord nuls)
-//      eta_K^2 = eta_1K^2 + eta_2K^2         eta^2 = sum_K eta_K^2
-//
-//  En P1 : u_h affine par morceaux -> Delta u_h = 0, donc eta_1K = h_K ||f||_{0,K}
-//
-//  Objectif : calculer eta, l'erreur vraie |u-u_h|_{1,Omega}, et l'indice
-//  d'efficacite  I_eff = eta / |u-u_h|_1  qui doit se STABILISER quand h->0.
-//
-//  Lancement :   FreeFem++ estimateur_residu_P1.edp
-//                FreeFem++ -nw estimateur_residu_P1.edp   (sans fenetre)
-// ==========================================================================
+//  Lancement :  FreeFem++ -nw estimateur_residu_P1.edp
+// ======================================================================
 
 verbosity = 0;
+ofstream res("resultats.txt");        // tout est aussi ecrit sur disque
 
-// --------------------------------------------------------------------------
-//  AFFICHAGE : si tu lances FreeFem++ sans serveur graphique (SSH, WSL,
-//  cluster, ou simplement avec l'option -nw), aucune fenetre ne peut
-//  s'ouvrir -- ffglut echoue silencieusement. Ce script ne depend donc
-//  d'aucune fenetre : il ecrit
-//      * le tableau de resultats dans  resultats.txt  (en plus de la console)
-//      * les figures dans  etaK.eps  et  efficacite_locale.eps
-//  L'option ps="..." de plot() fonctionne meme avec -nw.
-// --------------------------------------------------------------------------
-ofstream res("resultats.txt");
+// ---- 1. DONNEES -------------------------------------------------------
+func f      = 2*(x*(1-x) + y*(1-y));
+func uex    = x*(x-1)*y*(y-1);
+func dxuex  = (2*x-1)*y*(y-1);
+func dyuex  = x*(x-1)*(2*y-1);
+// NB : f_K depend du maillage -> elle ne peut pas etre une func globale,
+//      elle est calculee dans la boucle (section 2.3bis) comme fonction P0.
 
-// --------------------------------------------------------------------------
-//  1. DONNEES DU PROBLEME
-// --------------------------------------------------------------------------
-func f      = 2*(x*(1-x) + y*(1-y));      // second membre
-func uex    = x*(x-1)*y*(y-1);            // solution exacte
-func dxuex  = (2*x-1)*y*(y-1);            // du/dx
-func dyuex  = x*(x-1)*(2*y-1);            // du/dy
-
-int nraff = 5;                            // nombre de maillages emboites
-int N0    = 4;                            // finesse initiale
-
-real[int] tabh(nraff), taberr(nraff), tabeta(nraff), tabL2(nraff);
+int nraff = 6;
+int N0    = 4;
+real[int] tabh(nraff), taberr(nraff), tabeta(nraff), tabL2(nraff), tabosc(nraff);
 
 cout.precision(5);
-cout << endl;
-cout << "  Poisson Dirichlet homogene, carre unite, u = x(x-1)y(y-1)" << endl;
-cout << "  P1 Lagrange -- estimateur par residus" << endl << endl;
-cout << "    N      h        |u-u_h|_1       eta          eta_1        eta_2"
-     << "       I_eff" << endl;
-res  << "    N      h        |u-u_h|_1       eta          eta_1        eta_2"
-     << "       I_eff" << endl;
-cout << "  ------------------------------------------------------------------"
-     << "----------------" << endl;
+cout << "\n  Poisson Dirichlet homogene, carre unite, u = x(x-1)y(y-1)\n";
+cout << "  P1 Lagrange -- estimateur par residus\n\n";
+cout << "    N      h        |u-u_h|_1       eta          eta_1        eta_2       osc         I_eff" << endl;
+res  << "    N      h        |u-u_h|_1       eta          eta_1        eta_2       osc         I_eff" << endl;
 
-// --------------------------------------------------------------------------
-//  2. BOUCLE DE RAFFINEMENT UNIFORME
-// --------------------------------------------------------------------------
+// ---- 2. BOUCLE DE RAFFINEMENT UNIFORME --------------------------------
+// PIEGE : ne jamais nommer une variable N ici, N est la normale reservee
+// (N.x, N.y). D'ou Nx.
 int Nx = N0;
 for (int k = 0; k < nraff; k++)
 {
-    mesh Th = square(Nx, Nx);           // labels 1,2,3,4 sur les 4 cotes
-
-    fespace Vh(Th, P1);               // espace d'approximation
-    fespace Ph(Th, P0);               // une valeur par triangle : indicateurs
-
+    mesh Th = square(Nx, Nx);       // labels 1,2,3,4 sur les 4 cotes
+    fespace Vh(Th, P1);             // approximation
+    fespace Ph(Th, P0);             // une valeur par triangle : indicateurs
     Vh u, v;
 
-    // ---- 2.1 Resolution du probleme discret -----------------------------
-    // PIEGE : qforder par defaut = 3 ; on prend qforder=5 pour ne pas
-    // polluer l'erreur par la quadrature du second membre.
+    // 2.1 probleme discret (qforder=5 : marge, f*v est de degre 3)
     solve Poisson(u, v)
         = int2d(Th)( dx(u)*dx(v) + dy(u)*dy(v) )
         - int2d(Th, qforder=5)( f*v )
         + on(1, 2, 3, 4, u = 0);
 
-    // ---- 2.2 Erreur vraie (semi-norme H1 = norme d'energie) -------------
-    // |grad u - grad u_h|^2 est de degre 6 : qforder=8 par securite.
-    real err = sqrt( int2d(Th, qforder=8)( square(dx(u)-dxuex)
-                                         + square(dy(u)-dyuex) ) );
+    // 2.2 erreur L2 : (u_h - uex)^2 est de degre 8 -> quadrature renforcee
+    //     (l'erreur en energie est calculee en 2.3, triangle par triangle)
     real errL2 = sqrt( int2d(Th, qforder=8)( square(u-uex) ) );
 
-    // ---- 2.3 Indicateurs locaux -----------------------------------------
-    // Astuce FreeFem++ : on teste contre la fonction caracteristique chiK
-    // d'un element P0 ; le vecteur resultat contient donc, composante par
-    // composante, la valeur de l'integrale sur chaque triangle.
-    //
-    //  * intalledges parcourt les 3 aretes de CHAQUE triangle : une arete
-    //    interieure est visitee deux fois, une fois depuis chaque cote ;
-    //    c'est exactement le partage 1/2 - 1/2 du saut entre voisins.
-    //  * nTonEdge = 1 sur une arete du bord, 2 a l'interieur ;
-    //    le facteur (nTonEdge-1) annule donc eta_3K (Dirichlet homogene).
-
+    // 2.3 indicateurs locaux : test contre la caracteristique chiK (P0)
+    //     (Delta u_h = 0 en P1 ; dxx+dyy garde le code valable en P2)
     varf residuVol(unused, chiK)                       // eta_1K^2
-        = int2d(Th, qforder=6)( chiK * square(hTriangle) * square(f) );
-        // ( + Delta u_h = 0 en P1 ; en P2 il faudrait ajouter dxx(u)+dyy(u) )
+        = int2d(Th)( chiK * square(hTriangle) * square(f + dxx(u)+dyy(u)));
 
+    //  (nTonEdge-1) = 0 sur les aretes de bord -> pas de saut au bord
     varf sautFlux(unused, chiK)                        // eta_2K^2
         = intalledges(Th)( chiK * 0.5 * (nTonEdge-1) * lenEdge
                            * square( jump( N.x*dx(u) + N.y*dy(u) ) ) );
 
+    //  |grad u - grad u_h|^2 est de degre 6 > 5 (defaut) -> qforder=8
     varf erreurLoc(unused, chiK)                       // |u-u_h|^2_{1,K}
         = int2d(Th, qforder=8)( chiK * ( square(dx(u)-dxuex)
                                        + square(dy(u)-dyuex) ) );
@@ -116,75 +75,91 @@ for (int k = 0; k < nraff; k++)
     eta1sq[] = residuVol(0, Ph);
     eta2sq[] = sautFlux(0, Ph);
     errKsq[] = erreurLoc(0, Ph);
+    real err = sqrt( errKsq[].sum );   // |u-u_h|_1 = (sum_K |u-u_h|^2_{1,K})^{1/2}
+
+    // 2.3bis moyenne de f par element et oscillation des donnees
+    //  (ne PAS ecrire "Ph fK = f;" : ce serait f au barycentre)
+    varf aireVar(unused, chiK) = int2d(Th)( chiK );                  // |K|
+    varf moyF   (unused, chiK) = int2d(Th, qforder=5)( chiK * f );   // int_K f
+
+    Ph aireK, fK;
+    aireK[] = aireVar(0, Ph);
+    fK[]    = moyF(0, Ph);
+    fK[]  ./= aireK[];                                  // f_K = int_K f / |K|
+
+    varf oscData(unused, chiK)                          // osc_K^2
+        = int2d(Th, qforder=5)( chiK * square(hTriangle) * square(f - fK) );
+
+    Ph oscsq;
+    oscsq[] = oscData(0, Ph);
 
     Ph etaKsq = eta1sq + eta2sq;
     Ph etaK   = sqrt(etaKsq);
-
     real eta  = sqrt( etaKsq[].sum );
     real eta1 = sqrt( eta1sq[].sum );
     real eta2 = sqrt( eta2sq[].sum );
+    real osc  = sqrt( oscsq[].sum );
 
-    // ---- 2.4 Affichage ---------------------------------------------------
     cout << "  " << Nx << "   " << 1./Nx << "   " << err << "   " << eta
-         << "   " << eta1 << "   " << eta2 << "   " << eta/err << endl;
+         << "   " << eta1 << "   " << eta2 << "   " << osc << "   " << eta/err << endl;
     res  << "  " << Nx << "   " << 1./Nx << "   " << err << "   " << eta
-         << "   " << eta1 << "   " << eta2 << "   " << eta/err << endl;
+         << "   " << eta1 << "   " << eta2 << "   " << osc << "   " << eta/err << endl;
 
     tabh[k] = 1./Nx;  taberr[k] = err;  tabeta[k] = eta;  tabL2[k] = errL2;
+    tabosc[k] = osc;
 
-    // ---- 2.5 Efficacite LOCALE : eta_K / |u-u_h|_{1,K} -------------------
+    // 2.4 efficacite + export pour Python (dernier maillage)
     if (k == nraff-1)
     {
-        Ph ratio = sqrt(etaKsq) / sqrt(errKsq + 1e-30);
-        cout << endl << "  Efficacite locale sur le maillage le plus fin : "
-             << ratio[].min << " <= eta_K/|u-u_h|_{1,K} <= "
-             << ratio[].max << endl;
-        // ---- export du maillage et des eta_K pour tracer sous Python ----
-        // (format texte simple : nv nt / coordonnees / connectivite + eta_K)
+        // efficacite globale (un nombre)
+        real Ieff = eta / err;
+        cout << "\n  Efficacite globale : I_eff = " << Ieff << endl;
+
+        // efficacite locale (une valeur par triangle) -> tracable
+        Ph ratio = sqrt(etaKsq) / sqrt(errKsq);
+        cout << "  Efficacite locale : " << ratio[].min
+             << " <= eta_K/|u-u_h|_{1,K} <= " << ratio[].max << endl;
+        cout << "  Moyenne f_K : " << fK[].min << " <= f_K <= " << fK[].max << endl;
+
+        // nv nt / coordonnees / connectivite + eta_K + err_K + f_K + osc_K
+        // (toutes les colonnes de valeurs en norme, pas au carre)
         ofstream mm("maillage_etaK.txt");
+        mm.precision(12);                   // export pour calcul en aval
         mm << Th.nv << " " << Th.nt << endl;
         for (int iv = 0; iv < Th.nv; iv++)
             mm << Th(iv).x << " " << Th(iv).y << endl;
         for (int it = 0; it < Th.nt; it++)
             mm << int(Th[it][0]) << " " << int(Th[it][1]) << " "
                << int(Th[it][2]) << " " << etaK[][it] << " "
-               << sqrt(errKsq[][it]) << endl;
+               << sqrt(errKsq[][it]) << " " << fK[][it] << " "
+               << sqrt(oscsq[][it]) << endl;
 
-        // ps="..." : export EPS, fonctionne sans fenetre graphique.
-        plot(etaK,  fill=1, value=1, cmm="eta_K  (N="+Nx+")",
-             ps="etaK.eps");
+        // ps="..." : export EPS, fonctionne meme avec -nw
+        plot(etaK,  fill=1, value=1, cmm="eta_K (N="+Nx+")", ps="etaK.eps");
         plot(ratio, fill=1, value=1, cmm="efficacite locale",
              ps="efficacite_locale.eps");
+        plot(fK,    fill=1, value=1, cmm="f_K (moyenne de f par element)",
+             ps="fK.eps");
     }
-
     Nx = 2*Nx;
 }
 
-// --------------------------------------------------------------------------
-//  3. SYNTHESE
-// --------------------------------------------------------------------------
-cout << endl << "  Ordres de convergence observes :" << endl;
+// ---- 3. SYNTHESE ------------------------------------------------------
+cout << "\n  Ordres de convergence observes :" << endl;
 for (int k = 1; k < nraff; k++)
     cout << "    h = " << tabh[k]
          << "   ordre(|u-u_h|_1) = " << log(taberr[k-1]/taberr[k])/log(2.)
          << "   ordre(eta) = "       << log(tabeta[k-1]/tabeta[k])/log(2.)
+         << "   ordre(osc) = "       << log(tabosc[k-1]/tabosc[k])/log(2.)
          << "   ordre(||u-u_h||_0) = " << log(tabL2[k-1]/tabL2[k])/log(2.) << endl;
 
-cout << endl
-     << "  Conclusion : I_eff tend vers une constante independante de h." << endl
-     << "  L'estimateur est donc a la fois FIABLE (|u-u_h|_1 <= C eta)" << endl
-     << "  et EFFICACE (eta <= C' |u-u_h|_1), sans connaitre u." << endl << endl;
+// extrapolation de Richardson (ecarts divises par 2 -> convergence en O(h))
+real IeffFin  = tabeta[nraff-1] / taberr[nraff-1];
+real IeffPrec = tabeta[nraff-2] / taberr[nraff-2];
+cout << "\n  I_eff extrapole (h -> 0) : " << 2*IeffFin - IeffPrec << endl;
 
-// --------------------------------------------------------------------------
-//  REMARQUES PRATIQUES
-//  1. hTriangle = diametre du triangle courant, lenEdge = longueur de
-//     l'arete courante dans intalledges : ce sont les bonnes echelles h_K
-//     et h_E de la theorie.
-//  2. Ne pas oublier le facteur (nTonEdge-1) : sans lui on ajoute des sauts
-//     fantomes sur le bord et I_eff est faussee.
-//  3. Ici la solution est reguliere et le maillage uniforme : tous les eta_K
-//     se valent, il n'y a rien a raffiner. Pour voir l'interet de
-//     l'adaptation, reprendre ce code sur un domaine en L et boucler avec
-//     adaptmesh en utilisant etaK comme critere de marquage
-//     (cf. fichier compagnon adaptation_Lshape.edp).
+cout << "\n  I_eff tend vers une constante independante de h : l'estimateur"
+     << "\n  est FIABLE (|u-u_h|_1 <= C eta) et EFFICACE"
+     << "\n  (eta <= C' (|u-u_h|_1 + osc)), sans jamais utiliser u."
+     << "\n  osc = O(h^2) est d'ordre superieur a eta = O(h).\n" << endl;
 // --------------------------------------------------------------------------
